@@ -8,6 +8,15 @@ import android.app.Service
 import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.ServiceInfo
+import android.graphics.Bitmap
+import android.hardware.display.DisplayManager
+import android.hardware.display.VirtualDisplay
+import android.media.ImageReader
+import android.media.projection.MediaProjection
+import android.media.projection.MediaProjectionManager
+import android.util.Base64
+import android.util.DisplayMetrics
+import java.io.ByteArrayOutputStream
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.Typeface
@@ -45,6 +54,15 @@ class OverlayService : Service() {
     private val history = mutableListOf<Pair<String, String>>()
     private var game: String? = null
     private var busy = false
+    private var notif: Notification? = null
+    private var projection: MediaProjection? = null
+    private var vd: VirtualDisplay? = null
+    private var reader: ImageReader? = null
+    private var capW = 0
+    private var capH = 0
+    private var lastB64: String? = null
+    private var pending: String? = null
+    private lateinit var pendingLabel: TextView
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
@@ -59,13 +77,22 @@ class OverlayService : Service() {
         handler.post(scanner)
     }
 
-    override fun onStartCommand(i: Intent?, f: Int, id: Int): Int = START_STICKY
+    override fun onStartCommand(i: Intent?, f: Int, id: Int): Int {
+        val data = i?.getParcelableExtra<Intent>("mp_data")
+        val code = i?.getIntExtra("mp_code", 0) ?: 0
+        if (data != null && code != 0 && projection == null) {
+            goForeground(true)
+            startProjection(code, data)
+        }
+        return START_STICKY
+    }
 
     override fun onBind(i: Intent?): IBinder? = null
 
     override fun onDestroy() {
         running = false
         handler.removeCallbacksAndMessages(null)
+        cleanupProjection()
         try {
             if (panelOpen) wm.removeView(panel)
         } catch (e: Exception) {
@@ -92,8 +119,16 @@ class OverlayService : Service() {
             .setSmallIcon(android.R.drawable.ic_menu_info_details)
             .setContentIntent(pi)
             .build()
+        notif = n
+        goForeground(false)
+    }
+
+    private fun goForeground(withMp: Boolean) {
+        val n = notif ?: return
         if (Build.VERSION.SDK_INT >= 34) {
-            startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+            var t = ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+            if (withMp) t = t or ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+            startForeground(1, n, t)
         } else {
             startForeground(1, n)
         }
@@ -186,6 +221,30 @@ class OverlayService : Service() {
         scroll.addView(tv)
         panel.addView(scroll, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
 
+        pendingLabel = TextView(this).apply {
+            text = "📎 Ekran görüntüsü ekli (kaldırmak için dokun)"
+            setTextColor(Color.parseColor("#6FC3FF"))
+            textSize = 13f
+            visibility = View.GONE
+            setPadding(0, dp(6), 0, dp(6))
+            setOnClickListener { clearPending() }
+        }
+        panel.addView(pendingLabel)
+        val actions = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val shot = Button(this).apply {
+            text = "📷 Ekran al"
+            isAllCaps = false
+            setOnClickListener { captureScreen() }
+        }
+        val reply = Button(this).apply {
+            text = "Yanıtla"
+            isAllCaps = false
+            setOnClickListener { answerScreen() }
+        }
+        actions.addView(shot, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        actions.addView(reply, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        panel.addView(actions)
+
         val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         input = EditText(this).apply {
             hint = "Rebirth'e sor..."
@@ -223,30 +282,176 @@ class OverlayService : Service() {
         scroll.post { scroll.fullScroll(View.FOCUS_DOWN) }
     }
 
-    private fun sendChat() {
-        val t = input.text.toString().trim()
-        if (t.isEmpty() || busy) return
-        input.setText("")
-        append("Sen", t)
-        ask(t)
+    private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
+
+    private fun clearPending() {
+        pending = null
+        pendingLabel.visibility = View.GONE
     }
 
-    private fun ask(text: String) {
-        history.add("user" to text)
+    private fun sendChat() {
+        val t = input.text.toString().trim()
+        if (busy) {
+            toast("Bekle, cevap hazırlanıyor")
+            return
+        }
+        if (t.isEmpty()) {
+            if (pending != null) answerScreen()
+            return
+        }
+        input.setText("")
+        val img = pending
+        clearPending()
+        append("Sen", if (img != null) "📷 " + t else t)
+        ask(t, img)
+    }
+
+    private fun answerScreen() {
+        val img = pending
+        if (img == null) {
+            toast("Önce 📷 Ekran al'a bas")
+            return
+        }
+        if (busy) {
+            toast("Bekle, cevap hazırlanıyor")
+            return
+        }
+        clearPending()
+        append("Sen", "📷 Ekranı yanıtla")
+        ask(
+            "Ekran görüntüsüne bak. Ekranda oyun yoksa 'Ekranda oyun görmüyorum' de ve ne olduğunu " +
+                "tek cümleyle yaz. Oyun varsa oyuncunun durumunu değerlendir ve şimdi ne yapması " +
+                "gerektiğini kısa söyle.", img
+        )
+    }
+
+    private fun ask(text: String, img: String? = null) {
+        history.add("user" to (if (img != null) "[ekran görüntüsü] " + text else text))
         busy = true
         val key = prefs.getString("api_key", "") ?: ""
-        val model = prefs.getString("model", "gemini-2.5-flash") ?: "gemini-2.5-flash"
+        val model = prefs.getString("model", "qwen/qwen3.8-27b") ?: "qwen/qwen3.8-27b"
         val sys = "Sen Rebirth adında bir oyun asistanısın. Türkçe, kısa, net ve uygulanabilir cevap ver. " +
             "Oyuncunun şu an oynadığı oyun: " + (game ?: "bilinmiyor") + "."
         val ctx = history.takeLast(12).toList()
         Thread {
-            val out = Gemini.ask(key, model, ctx, sys)
+            val out = Gemini.ask(key, model, ctx, sys, img)
             handler.post {
                 history.add("model" to out)
                 append("Rebirth", out)
                 busy = false
                 if (!panelOpen) {
-                    Toast.makeText(this, "Rebirth: tavsiye hazır, daireye dokun", Toast.LENGTH_LONG).show()
+                    Toast.makeText(this, "Rebirth: cevap hazır, daireye dokun", Toast.LENGTH_LONG).show()
+                }
+            }
+        }.start()
+    }
+
+    // ---------------- ekran goruntusu ----------------
+    private fun screenSize(): IntArray {
+        val real = DisplayMetrics()
+        wm.defaultDisplay.getRealMetrics(real)
+        val s = Math.min(1f, 1280f / Math.max(real.widthPixels, real.heightPixels))
+        return intArrayOf((real.widthPixels * s).toInt(), (real.heightPixels * s).toInt(), real.densityDpi)
+    }
+
+    private fun startProjection(code: Int, data: Intent) {
+        try {
+            val mpm = getSystemService(MediaProjectionManager::class.java)
+            val mp = mpm.getMediaProjection(code, data)
+            mp.registerCallback(object : MediaProjection.Callback() {
+                override fun onStop() {
+                    handler.post { cleanupProjection() }
+                }
+            }, handler)
+            val sz = screenSize()
+            capW = sz[0]
+            capH = sz[1]
+            val r = ImageReader.newInstance(capW, capH, PixelFormat.RGBA_8888, 2)
+            reader = r
+            vd = mp.createVirtualDisplay(
+                "rebirth", capW, capH, sz[2],
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, r.surface, null, null
+            )
+            projection = mp
+            toast("Ekran okuma hazır")
+        } catch (e: Exception) {
+            toast("Ekran okuma başlatılamadı: " + e.message)
+        }
+    }
+
+    private fun cleanupProjection() {
+        val p = projection
+        projection = null
+        try { vd?.release() } catch (e: Exception) { }
+        try { reader?.close() } catch (e: Exception) { }
+        vd = null
+        reader = null
+        try { p?.stop() } catch (e: Exception) { }
+    }
+
+    private fun resizeIfNeeded() {
+        val sz = screenSize()
+        if (sz[0] == capW && sz[1] == capH) return
+        val nr = ImageReader.newInstance(sz[0], sz[1], PixelFormat.RGBA_8888, 2)
+        vd?.resize(sz[0], sz[1], sz[2])
+        vd?.surface = nr.surface
+        reader?.close()
+        reader = nr
+        capW = sz[0]
+        capH = sz[1]
+        Thread.sleep(600)
+    }
+
+    private fun grabFrame(): String? {
+        resizeIfNeeded()
+        val r = reader ?: return null
+        var img = r.acquireLatestImage()
+        if (img == null) {
+            Thread.sleep(500)
+            img = r.acquireLatestImage()
+        }
+        if (img == null) return lastB64
+        val w = img.width
+        val h = img.height
+        val plane = img.planes[0]
+        val pad = plane.rowStride - plane.pixelStride * w
+        val bmp = Bitmap.createBitmap(w + pad / plane.pixelStride, h, Bitmap.Config.ARGB_8888)
+        bmp.copyPixelsFromBuffer(plane.buffer)
+        img.close()
+        val crop = Bitmap.createBitmap(bmp, 0, 0, w, h)
+        val out = ByteArrayOutputStream()
+        crop.compress(Bitmap.CompressFormat.JPEG, 70, out)
+        lastB64 = Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP)
+        return lastB64
+    }
+
+    private fun captureScreen() {
+        if (vd == null) {
+            toast("Ekran okuma izni yok. Rebirth uygulamasından ▶ Başlat'a basıp izni ver.")
+            return
+        }
+        if (busy) {
+            toast("Bekle, cevap hazırlanıyor")
+            return
+        }
+        if (panelOpen) togglePanel()
+        bubble?.visibility = View.INVISIBLE
+        Thread {
+            var b64: String? = null
+            try {
+                Thread.sleep(400)
+                b64 = grabFrame()
+            } catch (e: Exception) {
+            }
+            handler.post {
+                bubble?.visibility = View.VISIBLE
+                if (!panelOpen) togglePanel()
+                if (b64 == null) {
+                    append("Rebirth", "Ekran görüntüsü alınamadı, tekrar dene.")
+                } else {
+                    pending = b64
+                    pendingLabel.visibility = View.VISIBLE
+                    append("Rebirth", "📷 Ekran görüntüsü alındı. Bir şey yazıp Gönder'e bas ya da Yanıtla'ya bas.")
                 }
             }
         }.start()

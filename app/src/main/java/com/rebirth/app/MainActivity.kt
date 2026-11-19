@@ -6,6 +6,7 @@ import android.content.Intent
 import android.content.SharedPreferences
 import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
+import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -95,7 +96,8 @@ class MainActivity : Activity() {
             } else if (!Settings.canDrawOverlays(this)) {
                 Toast.makeText(this, "Önce 1. izni ver", Toast.LENGTH_LONG).show()
             } else {
-                startForegroundService(Intent(this, OverlayService::class.java))
+                val mpm = getSystemService(MediaProjectionManager::class.java)
+                startActivityForResult(mpm.createScreenCaptureIntent(), 100)
             }
             status.postDelayed({ refresh() }, 700)
         }
@@ -114,6 +116,21 @@ class MainActivity : Activity() {
         sv.setBackgroundColor(Color.parseColor("#0E0E15"))
         sv.addView(root)
         setContentView(sv)
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == 100) {
+            val i = Intent(this, OverlayService::class.java)
+            if (resultCode == RESULT_OK && data != null) {
+                i.putExtra("mp_code", resultCode)
+                i.putExtra("mp_data", data)
+            } else {
+                Toast.makeText(this, "Ekran okuma izni verilmedi, sadece sohbet çalışır", Toast.LENGTH_LONG).show()
+            }
+            startForegroundService(i)
+            status.postDelayed({ refresh() }, 700)
+        }
     }
 
     override fun onResume() {
