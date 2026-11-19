@@ -84,7 +84,7 @@ object Gemini {
     }
 
     // Ses dosyasini yaziya cevirir. Hata olursa "ERR:" ile baslayan metin doner.
-    fun transcribe(key: String, file: java.io.File): String? {
+    fun transcribe(key: String, file: java.io.File, hint: String = ""): String? {
         if (key.isBlank()) return "ERR:Önce Groq API anahtarını gir."
         val boundary = "----rebirth" + System.currentTimeMillis()
         val bytes = file.readBytes()
@@ -105,6 +105,7 @@ object Gemini {
                 field("model", m)
                 field("language", "tr")
                 field("response_format", "text")
+                if (hint.isNotBlank()) field("prompt", hint)
                 out.write(("--" + boundary + "\r\nContent-Disposition: form-data; name=\"file\"; filename=\"voice.m4a\"\r\nContent-Type: audio/mp4\r\n\r\n").toByteArray())
                 out.write(bytes)
                 out.write(("\r\n--" + boundary + "--\r\n").toByteArray())

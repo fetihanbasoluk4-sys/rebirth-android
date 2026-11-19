@@ -16,6 +16,10 @@ import android.media.MediaRecorder
 import android.speech.tts.TextToSpeech
 import java.io.File
 import java.util.Locale
+import android.os.Bundle
+import android.speech.RecognitionListener
+import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
 import android.media.AudioManager
@@ -75,6 +79,8 @@ class OverlayService : Service() {
     private var recorder: MediaRecorder? = null
     private var audioFile: File? = null
     private var recording = false
+    private var recognizer: SpeechRecognizer? = null
+    private var listening = false
     private var micAnim: ValueAnimator? = null
     private var tts: TextToSpeech? = null
     private var ttsReady = false
@@ -125,6 +131,7 @@ class OverlayService : Service() {
         cleanupProjection()
         try { tts?.stop(); tts?.shutdown() } catch (e: Exception) { }
         try { recorder?.release() } catch (e: Exception) { }
+        try { recognizer?.destroy() } catch (e: Exception) { }
         try {
             if (panelOpen) wm.removeView(panel)
         } catch (e: Exception) {
@@ -447,7 +454,7 @@ class OverlayService : Service() {
         val key = prefs.getString("api_key", "") ?: ""
         val model = prefs.getString("model", "qwen/qwen3.8-27b") ?: "qwen/qwen3.8-27b"
         val sys = "Sen Rebirth adında bir oyun asistanısın. Türkçe, kısa, net ve uygulanabilir cevap ver. " +
-            "Oyuncunun şu an oynadığı oyun: " + (game ?: "bilinmiyor") + "." + (if (allowActions) ACTIONS else "")
+            "Oyuncunun şu an oynadığı oyun: " + (game ?: "bilinmiyor") + "." + (if (allowActions) ACTIONS + appHint() else "")
         val ctx = history.takeLast(12).toList()
         Thread {
             val out = Gemini.ask(key, model, ctx, sys, img)
@@ -504,7 +511,45 @@ class OverlayService : Service() {
                 }
             }
         }
+        if (best == null) {
+            var bestD = 99
+            for (ri in list) {
+                val n = norm(ri.loadLabel(pm).toString())
+                if (n.isEmpty()) continue
+                val d = lev(q, n)
+                if (d < bestD && d <= Math.max(2, q.length / 3)) {
+                    bestD = d
+                    best = Pair(ri.activityInfo.packageName, ri.loadLabel(pm).toString())
+                }
+            }
+        }
         return best
+    }
+
+    private fun lev(a: String, b: String): Int {
+        val dp = IntArray(b.length + 1) { it }
+        for (i in 1..a.length) {
+            var prev = dp[0]
+            dp[0] = i
+            for (j in 1..b.length) {
+                val tmp = dp[j]
+                dp[j] = Math.min(Math.min(dp[j] + 1, dp[j - 1] + 1), prev + (if (a[i - 1] == b[j - 1]) 0 else 1))
+                prev = tmp
+            }
+        }
+        return dp[b.length]
+    }
+
+    private fun appNames(): List<String> {
+        val pm = packageManager
+        val list = pm.queryIntentActivities(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0)
+        return list.map { it.loadLabel(pm).toString() }.filter { it.isNotBlank() }.distinct().sorted()
+    }
+
+    private fun appHint(): String {
+        return " Kullanıcı sesle konuşmuş olabilir ve yazı yanlış duyulmuş olabilir (örn. 'tubueyi' = YouTube). " +
+            "open_app için aşağıdaki listeden en yakın uygulamanın tam adını yaz. Yüklü uygulamalar: " +
+            appNames().joinToString(", ").take(1500)
     }
 
     private fun launch(i: Intent) {
@@ -638,10 +683,96 @@ class OverlayService : Service() {
     }
 
     private fun toggleMic() {
+        if (listening) {
+            recognizer?.stopListening()
+            return
+        }
         if (recording) stopAndTranscribe() else startRecording()
     }
 
+    private fun submitVoice(text: String) {
+        if (busy) return
+        val img = pending
+        clearPending()
+        input.setText("")
+        append("Sen", "🎤 " + text)
+        ask(text, img, true, img == null)
+    }
+
+    private fun startLive() {
+        try {
+            recognizer?.destroy()
+            val r = SpeechRecognizer.createSpeechRecognizer(this)
+            r.setRecognitionListener(object : RecognitionListener {
+                override fun onReadyForSpeech(p: Bundle?) {}
+                override fun onBeginningOfSpeech() {}
+                override fun onRmsChanged(v: Float) {}
+                override fun onBufferReceived(b: ByteArray?) {}
+                override fun onEndOfSpeech() {}
+                override fun onEvent(t: Int, p: Bundle?) {}
+                override fun onPartialResults(b: Bundle?) {
+                    val t = b?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
+                    if (!t.isNullOrBlank()) {
+                        input.setText(t)
+                        input.setSelection(input.text.length)
+                    }
+                }
+
+                override fun onResults(b: Bundle?) {
+                    listening = false
+                    micStyle(false)
+                    val t = b?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
+                    if (t.isNullOrBlank()) {
+                        toast("Anlayamadım, tekrar dene")
+                        return
+                    }
+                    input.setText(t)
+                    submitVoice(t)
+                }
+
+                override fun onError(e: Int) {
+                    listening = false
+                    micStyle(false)
+                    if (e == SpeechRecognizer.ERROR_NO_MATCH || e == SpeechRecognizer.ERROR_SPEECH_TIMEOUT) {
+                        toast("Ses duyulmadı, tekrar dene")
+                    } else if (e == SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS) {
+                        toast("Mikrofon izni yok")
+                    } else {
+                        toast("Google ses tanıma çalışmadı (" + e + "), yedek yönteme geçiliyor")
+                        startWhisper()
+                    }
+                }
+            })
+            val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+            i.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            i.putExtra(RecognizerIntent.EXTRA_LANGUAGE, "tr-TR")
+            i.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+            i.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
+            input.setText("")
+            r.startListening(i)
+            recognizer = r
+            listening = true
+            micStyle(true)
+        } catch (e: Exception) {
+            listening = false
+            startWhisper()
+        }
+    }
+
     private fun startRecording() {
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            toast("Mikrofon izni yok. Rebirth uygulamasında 'Mikrofon izni' düğmesine bas.")
+            return
+        }
+        if (busy) {
+            toast("Bekle, cevap hazırlanıyor")
+            return
+        }
+        tts?.stop()
+        if (SpeechRecognizer.isRecognitionAvailable(this)) startLive() else startWhisper()
+    }
+
+    private fun startWhisper() {
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             toast("Mikrofon izni yok. Rebirth uygulamasında 'Mikrofon izni' düğmesine bas.")
             return
@@ -689,17 +820,16 @@ class OverlayService : Service() {
         val key = prefs.getString("api_key", "") ?: ""
         busy = true
         toast("Dinliyorum...")
+        val hint = "Telefon komutları: YouTube'u aç, WhatsApp'ı aç. Uygulamalar: " + appNames().joinToString(", ").take(600)
         Thread {
-            val res = Gemini.transcribe(key, f)
+            val res = Gemini.transcribe(key, f, hint)
             handler.post {
                 busy = false
                 if (res == null || res.isBlank() || res.startsWith("ERR:")) {
                     toast(if (res != null && res.startsWith("ERR:")) res.substring(4) else "Sesi anlayamadım, tekrar dene")
                 } else {
-                    val img = pending
-                    clearPending()
-                    append("Sen", "🎤 " + res)
-                    ask(res, img, true, img == null)
+                    input.setText(res)
+                    submitVoice(res)
                 }
             }
         }.start()
