@@ -105,6 +105,7 @@ object Gemini {
                 field("model", m)
                 field("language", "tr")
                 field("response_format", "text")
+                field("temperature", "0")
                 if (hint.isNotBlank()) field("prompt", hint)
                 out.write(("--" + boundary + "\r\nContent-Disposition: form-data; name=\"file\"; filename=\"voice.m4a\"\r\nContent-Type: audio/mp4\r\n\r\n").toByteArray())
                 out.write(bytes)

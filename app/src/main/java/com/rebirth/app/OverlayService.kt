@@ -17,6 +17,7 @@ import android.speech.tts.TextToSpeech
 import java.io.File
 import java.util.Locale
 import android.os.Bundle
+import android.content.ComponentName
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
@@ -81,6 +82,7 @@ class OverlayService : Service() {
     private var recording = false
     private var recognizer: SpeechRecognizer? = null
     private var listening = false
+    private var liveBad = false
     private var micAnim: ValueAnimator? = null
     private var tts: TextToSpeech? = null
     private var ttsReady = false
@@ -699,10 +701,20 @@ class OverlayService : Service() {
         ask(text, img, true, img == null)
     }
 
-    private fun startLive() {
+    private fun startLive(useGoogle: Boolean = false) {
         try {
             recognizer?.destroy()
-            val r = SpeechRecognizer.createSpeechRecognizer(this)
+            val r = if (useGoogle) {
+                SpeechRecognizer.createSpeechRecognizer(
+                    this,
+                    ComponentName(
+                        "com.google.android.googlequicksearchbox",
+                        "com.google.android.voicesearch.serviceapi.GoogleRecognitionService"
+                    )
+                )
+            } else {
+                SpeechRecognizer.createSpeechRecognizer(this)
+            }
             r.setRecognitionListener(object : RecognitionListener {
                 override fun onReadyForSpeech(p: Bundle?) {}
                 override fun onBeginningOfSpeech() {}
@@ -726,6 +738,7 @@ class OverlayService : Service() {
                         toast("Anlayamadım, tekrar dene")
                         return
                     }
+                    liveBad = false
                     input.setText(t)
                     submitVoice(t)
                 }
@@ -738,8 +751,13 @@ class OverlayService : Service() {
                     } else if (e == SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS) {
                         toast("Mikrofon izni yok")
                     } else {
-                        toast("Google ses tanıma çalışmadı (" + e + "), yedek yönteme geçiliyor")
-                        startWhisper()
+                        if (!useGoogle) {
+                            handler.postDelayed({ startLive(true) }, 300)
+                        } else {
+                            liveBad = true
+                            toast("Canlı ses tanıma çalışmadı (" + e + "), yedek yönteme geçildi")
+                            handler.postDelayed({ startWhisper() }, 300)
+                        }
                     }
                 }
             })
@@ -769,7 +787,7 @@ class OverlayService : Service() {
             return
         }
         tts?.stop()
-        if (SpeechRecognizer.isRecognitionAvailable(this)) startLive() else startWhisper()
+        if (!liveBad && SpeechRecognizer.isRecognitionAvailable(this)) startLive() else startWhisper()
     }
 
     private fun startWhisper() {
@@ -785,11 +803,11 @@ class OverlayService : Service() {
         try {
             val f = File(cacheDir, "voice.m4a")
             val r = if (Build.VERSION.SDK_INT >= 31) MediaRecorder(this) else MediaRecorder()
-            r.setAudioSource(MediaRecorder.AudioSource.MIC)
+            r.setAudioSource(MediaRecorder.AudioSource.VOICE_RECOGNITION)
             r.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
             r.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
             r.setAudioSamplingRate(16000)
-            r.setAudioEncodingBitRate(64000)
+            r.setAudioEncodingBitRate(96000)
             r.setOutputFile(f.absolutePath)
             r.prepare()
             r.start()
