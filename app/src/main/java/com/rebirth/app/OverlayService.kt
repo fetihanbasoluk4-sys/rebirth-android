@@ -8,7 +8,22 @@ import android.app.Service
 import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.ServiceInfo
+import android.Manifest
+import android.animation.ValueAnimator
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
+import android.media.MediaRecorder
+import android.speech.tts.TextToSpeech
+import java.io.File
+import java.util.Locale
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraManager
+import android.media.AudioManager
+import android.net.Uri
+import android.provider.AlarmClock
+import android.provider.Settings
+import android.view.KeyEvent
+import org.json.JSONObject
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
 import android.media.ImageReader
@@ -48,13 +63,22 @@ class OverlayService : Service() {
     private lateinit var panel: LinearLayout
     private lateinit var scroll: ScrollView
     private lateinit var title: TextView
-    private lateinit var tv: TextView
+    private lateinit var chatBox: LinearLayout
+    private lateinit var mic: TextView
+    private lateinit var speakBtn: TextView
     private lateinit var input: EditText
     private var panelOpen = false
     private val history = mutableListOf<Pair<String, String>>()
     private var game: String? = null
     private var busy = false
     private var notif: Notification? = null
+    private var recorder: MediaRecorder? = null
+    private var audioFile: File? = null
+    private var recording = false
+    private var micAnim: ValueAnimator? = null
+    private var tts: TextToSpeech? = null
+    private var ttsReady = false
+    private var speakOn = false
     private var projection: MediaProjection? = null
     private var vd: VirtualDisplay? = null
     private var reader: ImageReader? = null
@@ -74,6 +98,12 @@ class OverlayService : Service() {
         startAsForeground()
         buildBubble()
         buildPanel()
+        tts = TextToSpeech(this) { st ->
+            if (st == TextToSpeech.SUCCESS) {
+                tts?.language = Locale("tr", "TR")
+                ttsReady = true
+            }
+        }
         handler.post(scanner)
     }
 
@@ -93,6 +123,8 @@ class OverlayService : Service() {
         running = false
         handler.removeCallbacksAndMessages(null)
         cleanupProjection()
+        try { tts?.stop(); tts?.shutdown() } catch (e: Exception) { }
+        try { recorder?.release() } catch (e: Exception) { }
         try {
             if (panelOpen) wm.removeView(panel)
         } catch (e: Exception) {
@@ -128,7 +160,14 @@ class OverlayService : Service() {
         if (Build.VERSION.SDK_INT >= 34) {
             var t = ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
             if (withMp) t = t or ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
-            startForeground(1, n, t)
+            if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+                t = t or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+            }
+            try {
+                startForeground(1, n, t)
+            } catch (e: Exception) {
+                startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+            }
         } else {
             startForeground(1, n)
         }
@@ -185,81 +224,142 @@ class OverlayService : Service() {
         bubble = b
     }
 
-    private fun buildPanel() {
-        panel = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(14), dp(12), dp(14), dp(12))
-            background = GradientDrawable().apply {
-                setColor(Color.parseColor("#F015151F"))
-                cornerRadius = dp(18).toFloat()
+    private fun chip(label: String, color: String, onClick: () -> Unit): TextView {
+        val t = TextView(this)
+        t.text = label
+        t.textSize = 14f
+        t.setTextColor(Color.WHITE)
+        t.gravity = Gravity.CENTER
+        t.setPadding(dp(14), dp(10), dp(14), dp(10))
+        val bg = GradientDrawable()
+        bg.setColor(Color.parseColor(color))
+        bg.cornerRadius = dp(20).toFloat()
+        t.background = bg
+        t.setOnClickListener { onClick() }
+        return t
+    }
+
+    private fun micStyle(rec: Boolean) {
+        val bg = GradientDrawable()
+        bg.shape = GradientDrawable.OVAL
+        bg.setColor(Color.parseColor(if (rec) "#E53935" else "#FF7A00"))
+        mic.background = bg
+        mic.text = if (rec) "⏹" else "🎤"
+        micAnim?.cancel()
+        mic.scaleX = 1f
+        mic.scaleY = 1f
+        if (rec) {
+            val a = ValueAnimator.ofFloat(1f, 1.18f)
+            a.duration = 550
+            a.repeatMode = ValueAnimator.REVERSE
+            a.repeatCount = ValueAnimator.INFINITE
+            a.addUpdateListener {
+                mic.scaleX = it.animatedValue as Float
+                mic.scaleY = it.animatedValue as Float
             }
+            a.start()
+            micAnim = a
         }
-        val head = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        title = TextView(this).apply {
-            text = "🔥 Rebirth"
-            setTextColor(Color.parseColor("#FF7A00"))
-            textSize = 18f
-            setTypeface(null, Typeface.BOLD)
+    }
+
+    private fun buildPanel() {
+        panel = LinearLayout(this)
+        panel.orientation = LinearLayout.VERTICAL
+        panel.setPadding(dp(14), dp(12), dp(14), dp(12))
+        val pbg = GradientDrawable()
+        pbg.setColor(Color.parseColor("#F2101018"))
+        pbg.cornerRadius = dp(24).toFloat()
+        pbg.setStroke(dp(1), Color.parseColor("#55FF7A00"))
+        panel.background = pbg
+
+        val head = LinearLayout(this)
+        head.orientation = LinearLayout.HORIZONTAL
+        head.gravity = Gravity.CENTER_VERTICAL
+        title = TextView(this)
+        title.text = "🔥 Rebirth"
+        title.setTextColor(Color.parseColor("#FF7A00"))
+        title.textSize = 18f
+        title.setTypeface(null, Typeface.BOLD)
+        head.addView(title, LinearLayout.LayoutParams(0, -2, 1f))
+        speakBtn = TextView(this)
+        speakBtn.text = "🔊"
+        speakBtn.textSize = 20f
+        speakBtn.alpha = 0.4f
+        speakBtn.setPadding(dp(10), 0, dp(10), 0)
+        speakBtn.setOnClickListener {
+            speakOn = !speakOn
+            speakBtn.alpha = if (speakOn) 1f else 0.4f
+            if (!speakOn) tts?.stop()
+            toast(if (speakOn) "Tüm cevaplar sesli okunacak" else "Sadece sesli sorulara sesli cevap")
         }
-        head.addView(title, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-        val close = TextView(this).apply {
-            text = "✕"
-            setTextColor(Color.WHITE)
-            textSize = 20f
-            setPadding(dp(12), 0, 0, 0)
-            setOnClickListener { togglePanel() }
-        }
+        head.addView(speakBtn)
+        val close = TextView(this)
+        close.text = "✕"
+        close.setTextColor(Color.WHITE)
+        close.textSize = 20f
+        close.setPadding(dp(10), 0, 0, 0)
+        close.setOnClickListener { togglePanel() }
         head.addView(close)
         panel.addView(head)
 
-        tv = TextView(this).apply {
-            setTextColor(Color.parseColor("#EEEEEE"))
-            textSize = 15f
-            text = "Merhaba! Bir oyun açtığında tavsiye vereceğim. Bana soru da sorabilirsin.\n\n"
-        }
+        chatBox = LinearLayout(this)
+        chatBox.orientation = LinearLayout.VERTICAL
         scroll = ScrollView(this)
-        scroll.addView(tv)
-        panel.addView(scroll, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
+        scroll.addView(chatBox)
+        panel.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
 
-        pendingLabel = TextView(this).apply {
-            text = "📎 Ekran görüntüsü ekli (kaldırmak için dokun)"
-            setTextColor(Color.parseColor("#6FC3FF"))
-            textSize = 13f
-            visibility = View.GONE
-            setPadding(0, dp(6), 0, dp(6))
-            setOnClickListener { clearPending() }
-        }
+        pendingLabel = TextView(this)
+        pendingLabel.text = "📎 Ekran görüntüsü ekli (kaldırmak için dokun)"
+        pendingLabel.setTextColor(Color.parseColor("#6FC3FF"))
+        pendingLabel.textSize = 13f
+        pendingLabel.visibility = View.GONE
+        pendingLabel.setPadding(0, dp(6), 0, dp(6))
+        pendingLabel.setOnClickListener { clearPending() }
         panel.addView(pendingLabel)
-        val actions = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        val shot = Button(this).apply {
-            text = "📷 Ekran al"
-            isAllCaps = false
-            setOnClickListener { captureScreen() }
-        }
-        val reply = Button(this).apply {
-            text = "Yanıtla"
-            isAllCaps = false
-            setOnClickListener { answerScreen() }
-        }
-        actions.addView(shot, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-        actions.addView(reply, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+
+        val actions = LinearLayout(this)
+        actions.orientation = LinearLayout.HORIZONTAL
+        val l1 = LinearLayout.LayoutParams(0, -2, 1f)
+        l1.rightMargin = dp(4)
+        val l2 = LinearLayout.LayoutParams(0, -2, 1f)
+        l2.leftMargin = dp(4)
+        actions.addView(chip("📷 Ekran al", "#33334A") { captureScreen() }, l1)
+        actions.addView(chip("✨ Yanıtla", "#33334A") { answerScreen() }, l2)
         panel.addView(actions)
 
-        val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        input = EditText(this).apply {
-            hint = "Rebirth'e sor..."
-            setTextColor(Color.WHITE)
-            setHintTextColor(Color.GRAY)
-            textSize = 15f
-            setSingleLine(true)
-        }
-        row.addView(input, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-        val send = Button(this).apply {
-            text = "Gönder"
-            setOnClickListener { sendChat() }
-        }
-        row.addView(send)
-        panel.addView(row)
+        val row = LinearLayout(this)
+        row.orientation = LinearLayout.HORIZONTAL
+        row.gravity = Gravity.CENTER_VERTICAL
+        val rl = LinearLayout.LayoutParams(-1, -2)
+        rl.topMargin = dp(8)
+        input = EditText(this)
+        input.hint = "Yaz ya da 🎤 ile konuş..."
+        input.setTextColor(Color.WHITE)
+        input.setHintTextColor(Color.GRAY)
+        input.textSize = 15f
+        input.setSingleLine(true)
+        val ibg = GradientDrawable()
+        ibg.setColor(Color.parseColor("#1C1C28"))
+        ibg.cornerRadius = dp(22).toFloat()
+        input.background = ibg
+        input.setPadding(dp(16), dp(10), dp(16), dp(10))
+        row.addView(input, LinearLayout.LayoutParams(0, -2, 1f))
+        mic = TextView(this)
+        mic.textSize = 22f
+        mic.gravity = Gravity.CENTER
+        mic.setOnClickListener { toggleMic() }
+        micStyle(false)
+        val ml = LinearLayout.LayoutParams(dp(50), dp(50))
+        ml.leftMargin = dp(8)
+        row.addView(mic, ml)
+        val send = chip("➤", "#FF7A00") { sendChat() }
+        send.setTextColor(Color.BLACK)
+        val sl = LinearLayout.LayoutParams(-2, -2)
+        sl.leftMargin = dp(6)
+        row.addView(send, sl)
+        panel.addView(row, rl)
+
+        append("Rebirth", "Merhaba! 🎤'a basıp konuşabilir, yazabilir ya da 📷 ile ekranı gösterebilirsin. Telefonu da kontrol ederim: 'YouTube'u aç', 'yarın 7'ye alarm kur', 'sesi kıs' de.")
     }
 
     private fun togglePanel() {
@@ -268,7 +368,7 @@ class OverlayService : Service() {
             panelOpen = false
         } else {
             val m = resources.displayMetrics
-            val lp = params((m.widthPixels * 0.92).toInt(), (m.heightPixels * 0.5).toInt(), true)
+            val lp = params((m.widthPixels * 0.94).toInt(), (m.heightPixels * 0.64).toInt(), true)
             lp.gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
             lp.y = dp(40)
             lp.softInputMode = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_PAN
@@ -278,7 +378,21 @@ class OverlayService : Service() {
     }
 
     private fun append(who: String, text: String) {
-        tv.append(who + ": " + text + "\n\n")
+        val ai = who == "Rebirth"
+        val t = TextView(this)
+        t.text = text
+        t.textSize = 15f
+        t.setTextColor(Color.WHITE)
+        t.setPadding(dp(12), dp(8), dp(12), dp(8))
+        val bg = GradientDrawable()
+        bg.setColor(Color.parseColor(if (ai) "#2B2233" else "#1F4E79"))
+        bg.cornerRadius = dp(16).toFloat()
+        t.background = bg
+        val lp = LinearLayout.LayoutParams(-2, -2)
+        lp.gravity = if (ai) Gravity.START else Gravity.END
+        lp.topMargin = dp(6)
+        if (ai) lp.rightMargin = dp(36) else lp.leftMargin = dp(36)
+        chatBox.addView(t, lp)
         scroll.post { scroll.fullScroll(View.FOCUS_DOWN) }
     }
 
@@ -303,7 +417,7 @@ class OverlayService : Service() {
         val img = pending
         clearPending()
         append("Sen", if (img != null) "📷 " + t else t)
-        ask(t, img)
+        ask(t, img, false, img == null)
     }
 
     private fun answerScreen() {
@@ -325,22 +439,267 @@ class OverlayService : Service() {
         )
     }
 
-    private fun ask(text: String, img: String? = null) {
+    private val ACTIONS = """ Kullanıcı telefonda bir işlem yapmanı isterse (uygulama aç, arama, yol tarifi, alarm, zamanlayıcı, ses, el feneri, ayar, müzik kontrolü), SADECE tek satır JSON döndür, başka hiçbir şey yazma. Biçimler: {"action":"open_app","app":"uygulama adı"} {"action":"web_search","query":"..."} {"action":"youtube_search","query":"..."} {"action":"navigate","place":"..."} {"action":"call","number":"..."} {"action":"alarm","hour":7,"minute":30} {"action":"timer","seconds":300} {"action":"settings","page":"wifi|bluetooth|display|sound|battery|apps|general"} {"action":"volume","dir":"up|down|mute"} {"action":"flashlight","on":true} {"action":"media","cmd":"play_pause|next|previous"} {"action":"open_url","url":"https://..."}. Komut değilse normal cevap ver."""
+
+    private fun ask(text: String, img: String? = null, byVoice: Boolean = false, allowActions: Boolean = false) {
         history.add("user" to (if (img != null) "[ekran görüntüsü] " + text else text))
         busy = true
         val key = prefs.getString("api_key", "") ?: ""
         val model = prefs.getString("model", "qwen/qwen3.8-27b") ?: "qwen/qwen3.8-27b"
         val sys = "Sen Rebirth adında bir oyun asistanısın. Türkçe, kısa, net ve uygulanabilir cevap ver. " +
-            "Oyuncunun şu an oynadığı oyun: " + (game ?: "bilinmiyor") + "."
+            "Oyuncunun şu an oynadığı oyun: " + (game ?: "bilinmiyor") + "." + (if (allowActions) ACTIONS else "")
         val ctx = history.takeLast(12).toList()
         Thread {
             val out = Gemini.ask(key, model, ctx, sys, img)
             handler.post {
-                history.add("model" to out)
-                append("Rebirth", out)
+                val done = (if (allowActions) runAction(out) else null) ?: out
+                history.add("model" to done)
+                append("Rebirth", done)
                 busy = false
+                if (byVoice || speakOn) speak(done)
                 if (!panelOpen) {
                     Toast.makeText(this, "Rebirth: cevap hazır, daireye dokun", Toast.LENGTH_LONG).show()
+                }
+            }
+        }.start()
+    }
+
+    // ---------------- telefon kontrolu ----------------
+    private val aliases = mapOf(
+        "ayarlar" to "settings", "kamera" to "camera", "rehber" to "contacts",
+        "telefon" to "phone", "mesajlar" to "messages", "saat" to "clock",
+        "takvim" to "calendar", "galeri" to "gallery", "hesapmakinesi" to "calculator",
+        "harita" to "maps", "haritalar" to "maps", "tarayici" to "chrome"
+    )
+
+    private fun norm(s: String): String {
+        var t = s.lowercase(Locale("tr", "TR"))
+        t = t.replace('ı', 'i').replace('ş', 's').replace('ğ', 'g')
+            .replace('ü', 'u').replace('ö', 'o').replace('ç', 'c')
+        return t.replace(Regex("[^a-z0-9]"), "")
+    }
+
+    private fun findApp(query: String): Pair<String, String>? {
+        val q = norm(query)
+        if (q.isEmpty()) return null
+        val qs = listOfNotNull(q, aliases[q])
+        val pm = packageManager
+        val list = pm.queryIntentActivities(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0)
+        var best: Pair<String, String>? = null
+        var bestScore = 0
+        for (ri in list) {
+            val label = ri.loadLabel(pm).toString()
+            val n = norm(label)
+            if (n.isEmpty()) continue
+            for (cand in qs) {
+                val score = when {
+                    n == cand -> 3
+                    n.startsWith(cand) || (cand.startsWith(n) && n.length > 2) -> 2
+                    n.contains(cand) -> 1
+                    else -> 0
+                }
+                if (score > bestScore) {
+                    bestScore = score
+                    best = Pair(ri.activityInfo.packageName, label)
+                }
+            }
+        }
+        return best
+    }
+
+    private fun launch(i: Intent) {
+        i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        startActivity(i)
+    }
+
+    private fun runAction(out: String): String? {
+        var s = out.trim()
+        if (s.startsWith("```")) s = s.removePrefix("```json").removePrefix("```").removeSuffix("```").trim()
+        if (!s.startsWith("{") || !s.endsWith("}")) return null
+        val j = try { JSONObject(s) } catch (e: Exception) { return null }
+        val a = j.optString("action")
+        if (a.isEmpty()) return null
+        return try {
+            doAction(a, j)
+        } catch (e: Exception) {
+            "Yapamadım: " + e.message
+        }
+    }
+
+    private fun doAction(a: String, j: JSONObject): String {
+        when (a) {
+            "open_app" -> {
+                val q = j.optString("app")
+                val app = findApp(q) ?: return "'" + q + "' adlı uygulamayı bulamadım."
+                val li = packageManager.getLaunchIntentForPackage(app.first) ?: return "Açamadım: " + q
+                launch(li)
+                return "✅ " + app.second + " açılıyor"
+            }
+            "web_search" -> {
+                val q = j.optString("query")
+                launch(Intent(Intent.ACTION_VIEW, Uri.parse("https://www.google.com/search?q=" + Uri.encode(q))))
+                return "🔎 Aranıyor: " + q
+            }
+            "youtube_search" -> {
+                val q = j.optString("query")
+                try {
+                    launch(Intent(Intent.ACTION_SEARCH).setPackage("com.google.android.youtube").putExtra("query", q))
+                } catch (e: Exception) {
+                    launch(Intent(Intent.ACTION_VIEW, Uri.parse("https://www.youtube.com/results?search_query=" + Uri.encode(q))))
+                }
+                return "▶ YouTube'da aranıyor: " + q
+            }
+            "navigate" -> {
+                val p = j.optString("place")
+                launch(Intent(Intent.ACTION_VIEW, Uri.parse("geo:0,0?q=" + Uri.encode(p))))
+                return "🧭 Haritada açılıyor: " + p
+            }
+            "call" -> {
+                val n = j.optString("number")
+                if (n.isBlank()) return "Hangi numarayı arayayım?"
+                launch(Intent(Intent.ACTION_DIAL, Uri.parse("tel:" + Uri.encode(n))))
+                return "📞 Çeviriciye " + n + " yazıldı, aramak için yeşil tuşa bas"
+            }
+            "alarm" -> {
+                val h = j.optInt("hour", 7)
+                val m = j.optInt("minute", 0)
+                launch(
+                    Intent(AlarmClock.ACTION_SET_ALARM).putExtra(AlarmClock.EXTRA_HOUR, h)
+                        .putExtra(AlarmClock.EXTRA_MINUTES, m).putExtra(AlarmClock.EXTRA_SKIP_UI, true)
+                )
+                return "⏰ Alarm kuruldu: " + String.format("%02d:%02d", h, m)
+            }
+            "timer" -> {
+                val sec = j.optInt("seconds", 60)
+                launch(
+                    Intent(AlarmClock.ACTION_SET_TIMER).putExtra(AlarmClock.EXTRA_LENGTH, sec)
+                        .putExtra(AlarmClock.EXTRA_SKIP_UI, true)
+                )
+                return "⏱ Zamanlayıcı başladı: " + sec + " saniye"
+            }
+            "settings" -> {
+                val act = when (j.optString("page")) {
+                    "wifi" -> Settings.ACTION_WIFI_SETTINGS
+                    "bluetooth" -> Settings.ACTION_BLUETOOTH_SETTINGS
+                    "display" -> Settings.ACTION_DISPLAY_SETTINGS
+                    "sound" -> Settings.ACTION_SOUND_SETTINGS
+                    "battery" -> Settings.ACTION_BATTERY_SAVER_SETTINGS
+                    "apps" -> Settings.ACTION_APPLICATION_SETTINGS
+                    else -> Settings.ACTION_SETTINGS
+                }
+                launch(Intent(act))
+                return "⚙ Ayarlar açıldı"
+            }
+            "volume" -> {
+                val am = getSystemService(AUDIO_SERVICE) as AudioManager
+                val d = when (j.optString("dir")) {
+                    "up" -> AudioManager.ADJUST_RAISE
+                    "down" -> AudioManager.ADJUST_LOWER
+                    else -> AudioManager.ADJUST_MUTE
+                }
+                am.adjustStreamVolume(AudioManager.STREAM_MUSIC, d, AudioManager.FLAG_SHOW_UI)
+                return "🔊 Ses ayarlandı"
+            }
+            "flashlight" -> {
+                val on = j.optBoolean("on", true)
+                val cm = getSystemService(CAMERA_SERVICE) as CameraManager
+                val id = cm.cameraIdList.firstOrNull {
+                    cm.getCameraCharacteristics(it).get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
+                } ?: return "Bu telefonda el feneri yok"
+                cm.setTorchMode(id, on)
+                return if (on) "🔦 El feneri açıldı" else "🔦 El feneri kapandı"
+            }
+            "media" -> {
+                val am = getSystemService(AUDIO_SERVICE) as AudioManager
+                val code = when (j.optString("cmd")) {
+                    "next" -> KeyEvent.KEYCODE_MEDIA_NEXT
+                    "previous" -> KeyEvent.KEYCODE_MEDIA_PREVIOUS
+                    else -> KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE
+                }
+                am.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, code))
+                am.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_UP, code))
+                return "🎵 Müzik komutu gönderildi"
+            }
+            "open_url" -> {
+                val u = j.optString("url")
+                if (!u.startsWith("http")) return "Sadece web adreslerini açabilirim"
+                launch(Intent(Intent.ACTION_VIEW, Uri.parse(u)))
+                return "🌐 Açılıyor: " + u
+            }
+        }
+        return "Bu komutu yapamıyorum."
+    }
+
+    // ---------------- ses ----------------
+    private fun speak(text: String) {
+        if (!ttsReady) return
+        val clean = text.replace(Regex("[*#_`>]"), "").take(700)
+        tts?.speak(clean, TextToSpeech.QUEUE_FLUSH, null, "rebirth")
+    }
+
+    private fun toggleMic() {
+        if (recording) stopAndTranscribe() else startRecording()
+    }
+
+    private fun startRecording() {
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            toast("Mikrofon izni yok. Rebirth uygulamasında 'Mikrofon izni' düğmesine bas.")
+            return
+        }
+        if (busy) {
+            toast("Bekle, cevap hazırlanıyor")
+            return
+        }
+        tts?.stop()
+        try {
+            val f = File(cacheDir, "voice.m4a")
+            val r = if (Build.VERSION.SDK_INT >= 31) MediaRecorder(this) else MediaRecorder()
+            r.setAudioSource(MediaRecorder.AudioSource.MIC)
+            r.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+            r.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+            r.setAudioSamplingRate(16000)
+            r.setAudioEncodingBitRate(64000)
+            r.setOutputFile(f.absolutePath)
+            r.prepare()
+            r.start()
+            recorder = r
+            audioFile = f
+            recording = true
+            micStyle(true)
+        } catch (e: Exception) {
+            recorder = null
+            toast("Mikrofon başlatılamadı: " + e.message)
+        }
+    }
+
+    private fun stopAndTranscribe() {
+        recording = false
+        micStyle(false)
+        val r = recorder
+        recorder = null
+        try {
+            r?.stop()
+        } catch (e: Exception) {
+            try { r?.release() } catch (x: Exception) { }
+            toast("Kayıt çok kısa, tekrar dene")
+            return
+        }
+        r?.release()
+        val f = audioFile ?: return
+        val key = prefs.getString("api_key", "") ?: ""
+        busy = true
+        toast("Dinliyorum...")
+        Thread {
+            val res = Gemini.transcribe(key, f)
+            handler.post {
+                busy = false
+                if (res == null || res.isBlank() || res.startsWith("ERR:")) {
+                    toast(if (res != null && res.startsWith("ERR:")) res.substring(4) else "Sesi anlayamadım, tekrar dene")
+                } else {
+                    val img = pending
+                    clearPending()
+                    append("Sen", "🎤 " + res)
+                    ask(res, img, true, img == null)
                 }
             }
         }.start()

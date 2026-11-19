@@ -82,4 +82,43 @@ object Gemini {
         }
         return "Uygun model bulunamadı. Son hata: " + last
     }
+
+    // Ses dosyasini yaziya cevirir. Hata olursa "ERR:" ile baslayan metin doner.
+    fun transcribe(key: String, file: java.io.File): String? {
+        if (key.isBlank()) return "ERR:Önce Groq API anahtarını gir."
+        val boundary = "----rebirth" + System.currentTimeMillis()
+        val bytes = file.readBytes()
+        for (m in listOf("whisper-large-v3-turbo", "whisper-large-v3")) {
+            try {
+                val c = URL("https://api.groq.com/openai/v1/audio/transcriptions").openConnection() as HttpURLConnection
+                c.requestMethod = "POST"
+                c.doOutput = true
+                c.setRequestProperty("Authorization", "Bearer " + key)
+                c.setRequestProperty("Content-Type", "multipart/form-data; boundary=" + boundary)
+                c.setRequestProperty("User-Agent", "Rebirth-Android/1.0")
+                c.connectTimeout = 20000
+                c.readTimeout = 60000
+                val out = c.outputStream
+                fun field(name: String, value: String) {
+                    out.write(("--" + boundary + "\r\nContent-Disposition: form-data; name=\"" + name + "\"\r\n\r\n" + value + "\r\n").toByteArray())
+                }
+                field("model", m)
+                field("language", "tr")
+                field("response_format", "text")
+                out.write(("--" + boundary + "\r\nContent-Disposition: form-data; name=\"file\"; filename=\"voice.m4a\"\r\nContent-Type: audio/mp4\r\n\r\n").toByteArray())
+                out.write(bytes)
+                out.write(("\r\n--" + boundary + "--\r\n").toByteArray())
+                out.flush()
+                val code = c.responseCode
+                val stream = if (code in 200..299) c.inputStream else c.errorStream
+                val txt = stream.bufferedReader().use { it.readText() }
+                c.disconnect()
+                if (code in 200..299) return txt.trim()
+                if (code == 429) return "ERR:Limit doldu, biraz bekle."
+                if (code == 401) return "ERR:API anahtarı yanlış."
+            } catch (e: Exception) {
+            }
+        }
+        return null
+    }
 }
