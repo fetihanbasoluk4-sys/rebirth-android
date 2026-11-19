@@ -11,12 +11,12 @@ jobs:
         with:
           distribution: temurin
           java-version: 17
-      - uses: android-actions/setup-android@v3
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: 8.9
       - name: Build
         run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
           ROOT=""
           for s in $(find . -name settings.gradle.kts); do
             d=$(dirname "$s")
@@ -24,7 +24,6 @@ jobs:
           done
           echo "Bulunan projeler:"; find . -name settings.gradle.kts
           if [ -z "$ROOT" ]; then echo "HATA: Yeni kod repoda yok"; exit 1; fi
-          echo "Derlenen klasor: $ROOT"
           cd "$ROOT"
           gradle assembleDebug --no-daemon --stacktrace
       - uses: actions/upload-artifact@v4
