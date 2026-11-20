@@ -114,6 +114,12 @@ class MainActivity : Activity() {
         pill(c2, "3   Mikrofon izni", "#2A2A3A", "#FFFFFF") {
             requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 2)
         }
+        pill(c2, "3+  Rehber izni (kişi arama için)", "#2A2A3A", "#FFFFFF") {
+            requestPermissions(arrayOf(Manifest.permission.READ_CONTACTS), 3)
+        }
+        pill(c2, "3+  Arka planda kapanmasın", "#2A2A3A", "#FFFFFF") {
+            startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:" + packageName)))
+        }
         keyBox = EditText(this)
         keyBox.hint = "Groq API anahtarı"
         keyBox.setTextColor(Color.WHITE)
@@ -191,6 +197,7 @@ class MainActivity : Activity() {
         status.text = mark(Settings.canDrawOverlays(this)) + "  Üstte gösterme izni\n" +
             mark(GameDetector.hasAccess(this)) + "  Kullanım erişimi\n" +
             mark(micOk) + "  Mikrofon\n" +
+            mark(checkSelfPermission(Manifest.permission.READ_CONTACTS) == PackageManager.PERMISSION_GRANTED) + "  Rehber\n" +
             mark(!prefs.getString("api_key", "").isNullOrBlank()) + "  Groq anahtarı\n" +
             (if (OverlayService.running) "🟢  Çalışıyor" else "⚪  Kapalı")
         startBtn.text = if (OverlayService.running) "■  Durdur" else "▶  Başlat"

@@ -30,7 +30,7 @@ object Gemini {
 
     fun ask(
         key: String, model: String, history: List<Pair<String, String>>,
-        system: String, imageB64: String? = null
+        system: String, imageB64: String? = null, think: Boolean = false
     ): String {
         if (key.isBlank()) return "Önce Rebirth uygulamasını açıp Groq API anahtarını gir."
         val messages = JSONArray()
@@ -57,14 +57,14 @@ object Gemini {
         try {
             for (m in cands) {
                 for (noThink in listOf(true, false)) {
-                    if (noThink && !m.startsWith("qwen")) continue
-                    val body = JSONObject().put("model", m).put("messages", messages).put("max_tokens", 1024)
+                    if (noThink && (think || !m.startsWith("qwen"))) continue
+                    val body = JSONObject().put("model", m).put("messages", messages).put("max_tokens", if (think) 2500 else 1024)
                     if (noThink) body.put("reasoning_effort", "none")
                     val (code, txt) = post(key, body)
                     if (code in 200..299) {
                         val out = JSONObject(txt).getJSONArray("choices").getJSONObject(0)
                             .getJSONObject("message").optString("content", "")
-                        val clean = out.replace(Regex("(?s)<think>.*?</think>"), "").trim()
+                        val clean = out.replace(Regex("(?s)<think>.*?</think>"), "").trim().let { if (it.contains("<think>")) "" else it }
                         if (clean.isNotEmpty()) return clean
                         continue
                     }
@@ -88,7 +88,7 @@ object Gemini {
         if (key.isBlank()) return "ERR:Önce Groq API anahtarını gir."
         val boundary = "----rebirth" + System.currentTimeMillis()
         val bytes = file.readBytes()
-        for (m in listOf("whisper-large-v3-turbo", "whisper-large-v3")) {
+        for (m in listOf("whisper-large-v3", "whisper-large-v3-turbo")) {
             try {
                 val c = URL("https://api.groq.com/openai/v1/audio/transcriptions").openConnection() as HttpURLConnection
                 c.requestMethod = "POST"

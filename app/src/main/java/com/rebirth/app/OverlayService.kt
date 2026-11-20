@@ -16,7 +16,10 @@ import android.media.MediaRecorder
 import android.speech.tts.TextToSpeech
 import java.io.File
 import java.util.Locale
+import android.provider.ContactsContract
 import android.os.Bundle
+import android.text.Editable
+import android.text.TextWatcher
 import android.content.ComponentName
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
@@ -82,7 +85,12 @@ class OverlayService : Service() {
     private var recording = false
     private var recognizer: SpeechRecognizer? = null
     private var listening = false
-    private var liveBad = false
+    private var liveBad = true
+    private var baseGame: String? = null
+    private var identToken = 0
+    private var recStart = 0L
+    private var lastLoud = 0L
+    private var heardVoice = false
     private var micAnim: ValueAnimator? = null
     private var tts: TextToSpeech? = null
     private var ttsReady = false
@@ -194,7 +202,7 @@ class OverlayService : Service() {
     }
 
     private fun buildBubble() {
-        val size = dp(56)
+        val size = dp(62)
         val b = BubbleView(this)
         val lp = params(size, size, false)
         lp.x = resources.displayMetrics.widthPixels - size - dp(4)
@@ -248,12 +256,17 @@ class OverlayService : Service() {
         return t
     }
 
+    private fun ovalBg(color: String): GradientDrawable {
+        val g = GradientDrawable()
+        g.shape = GradientDrawable.OVAL
+        g.setColor(Color.parseColor(color))
+        return g
+    }
+
     private fun micStyle(rec: Boolean) {
-        val bg = GradientDrawable()
-        bg.shape = GradientDrawable.OVAL
-        bg.setColor(Color.parseColor(if (rec) "#E53935" else "#FF7A00"))
-        mic.background = bg
+        mic.background = if (rec) ovalBg("#FFD0D0") else null
         mic.text = if (rec) "⏹" else "🎤"
+        bubble?.mode = if (rec) 1 else 0
         micAnim?.cancel()
         mic.scaleX = 1f
         mic.scaleY = 1f
@@ -271,28 +284,37 @@ class OverlayService : Service() {
         }
     }
 
+    private fun iconBtn(label: String, onClick: () -> Unit): TextView {
+        val t = TextView(this)
+        t.text = label
+        t.textSize = 20f
+        t.gravity = Gravity.CENTER
+        t.setOnClickListener { onClick() }
+        return t
+    }
+
     private fun buildPanel() {
         panel = LinearLayout(this)
         panel.orientation = LinearLayout.VERTICAL
-        panel.setPadding(dp(14), dp(12), dp(14), dp(12))
+        panel.setPadding(dp(12), dp(12), dp(12), dp(12))
         val pbg = GradientDrawable()
-        pbg.setColor(Color.parseColor("#F2101018"))
-        pbg.cornerRadius = dp(24).toFloat()
-        pbg.setStroke(dp(1), Color.parseColor("#55FF7A00"))
+        pbg.setColor(Color.parseColor("#F2E6E6EA"))
+        pbg.cornerRadius = dp(28).toFloat()
         panel.background = pbg
 
         val head = LinearLayout(this)
         head.orientation = LinearLayout.HORIZONTAL
         head.gravity = Gravity.CENTER_VERTICAL
+        head.setPadding(dp(6), 0, 0, 0)
         title = TextView(this)
-        title.text = "🔥 Rebirth"
-        title.setTextColor(Color.parseColor("#FF7A00"))
-        title.textSize = 18f
+        title.text = "Rebirth"
+        title.setTextColor(Color.parseColor("#1A1A1F"))
+        title.textSize = 17f
         title.setTypeface(null, Typeface.BOLD)
         head.addView(title, LinearLayout.LayoutParams(0, -2, 1f))
         speakBtn = TextView(this)
         speakBtn.text = "🔊"
-        speakBtn.textSize = 20f
+        speakBtn.textSize = 19f
         speakBtn.alpha = 0.4f
         speakBtn.setPadding(dp(10), 0, dp(10), 0)
         speakBtn.setOnClickListener {
@@ -304,9 +326,9 @@ class OverlayService : Service() {
         head.addView(speakBtn)
         val close = TextView(this)
         close.text = "✕"
-        close.setTextColor(Color.WHITE)
-        close.textSize = 20f
-        close.setPadding(dp(10), 0, 0, 0)
+        close.setTextColor(Color.parseColor("#1A1A1F"))
+        close.textSize = 19f
+        close.setPadding(dp(10), 0, dp(6), 0)
         close.setOnClickListener { togglePanel() }
         head.addView(close)
         panel.addView(head)
@@ -319,56 +341,67 @@ class OverlayService : Service() {
 
         pendingLabel = TextView(this)
         pendingLabel.text = "📎 Ekran görüntüsü ekli (kaldırmak için dokun)"
-        pendingLabel.setTextColor(Color.parseColor("#6FC3FF"))
+        pendingLabel.setTextColor(Color.parseColor("#2962FF"))
         pendingLabel.textSize = 13f
         pendingLabel.visibility = View.GONE
-        pendingLabel.setPadding(0, dp(6), 0, dp(6))
+        pendingLabel.setPadding(dp(8), dp(6), 0, dp(6))
         pendingLabel.setOnClickListener { clearPending() }
         panel.addView(pendingLabel)
 
-        val actions = LinearLayout(this)
-        actions.orientation = LinearLayout.HORIZONTAL
-        val l1 = LinearLayout.LayoutParams(0, -2, 1f)
-        l1.rightMargin = dp(4)
-        val l2 = LinearLayout.LayoutParams(0, -2, 1f)
-        l2.leftMargin = dp(4)
-        actions.addView(chip("📷 Ekran al", "#33334A") { captureScreen() }, l1)
-        actions.addView(chip("✨ Yanıtla", "#33334A") { answerScreen() }, l2)
-        panel.addView(actions)
+        // beyaz yazi karti (Figma sablonu gibi)
+        val card = LinearLayout(this)
+        card.orientation = LinearLayout.VERTICAL
+        val cbg = GradientDrawable()
+        cbg.setColor(Color.WHITE)
+        cbg.cornerRadius = dp(26).toFloat()
+        card.background = cbg
+        card.setPadding(dp(16), dp(10), dp(10), dp(8))
 
-        val row = LinearLayout(this)
-        row.orientation = LinearLayout.HORIZONTAL
-        row.gravity = Gravity.CENTER_VERTICAL
-        val rl = LinearLayout.LayoutParams(-1, -2)
-        rl.topMargin = dp(8)
         input = EditText(this)
-        input.hint = "Yaz ya da 🎤 ile konuş..."
-        input.setTextColor(Color.WHITE)
-        input.setHintTextColor(Color.GRAY)
-        input.textSize = 15f
+        input.hint = "Ne öğrenmek istersin?"
+        input.setTextColor(Color.parseColor("#111111"))
+        input.setHintTextColor(Color.parseColor("#9A9AA5"))
+        input.textSize = 16f
         input.setSingleLine(true)
-        val ibg = GradientDrawable()
-        ibg.setColor(Color.parseColor("#1C1C28"))
-        ibg.cornerRadius = dp(22).toFloat()
-        input.background = ibg
-        input.setPadding(dp(16), dp(10), dp(16), dp(10))
-        row.addView(input, LinearLayout.LayoutParams(0, -2, 1f))
+        input.setBackgroundColor(Color.TRANSPARENT)
+        input.setPadding(0, dp(6), 0, dp(10))
+        card.addView(input, LinearLayout.LayoutParams(-1, -2))
+
+        val icons = LinearLayout(this)
+        icons.orientation = LinearLayout.HORIZONTAL
+        icons.gravity = Gravity.CENTER_VERTICAL
+        icons.addView(iconBtn("🖼") { captureScreen() }, LinearLayout.LayoutParams(dp(44), dp(44)))
+        icons.addView(iconBtn("✨") { answerScreen() }, LinearLayout.LayoutParams(dp(44), dp(44)))
         mic = TextView(this)
-        mic.textSize = 22f
+        mic.textSize = 20f
         mic.gravity = Gravity.CENTER
         mic.setOnClickListener { toggleMic() }
-        micStyle(false)
-        val ml = LinearLayout.LayoutParams(dp(50), dp(50))
-        ml.leftMargin = dp(8)
-        row.addView(mic, ml)
-        val send = chip("➤", "#FF7A00") { sendChat() }
-        send.setTextColor(Color.BLACK)
-        val sl = LinearLayout.LayoutParams(-2, -2)
-        sl.leftMargin = dp(6)
-        row.addView(send, sl)
-        panel.addView(row, rl)
+        icons.addView(mic, LinearLayout.LayoutParams(dp(44), dp(44)))
+        icons.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
+        val sendBtn = TextView(this)
+        sendBtn.text = "↑"
+        sendBtn.textSize = 22f
+        sendBtn.setTextColor(Color.WHITE)
+        sendBtn.setTypeface(null, Typeface.BOLD)
+        sendBtn.gravity = Gravity.CENTER
+        sendBtn.background = ovalBg("#C9C9D0")
+        sendBtn.setOnClickListener { sendChat() }
+        icons.addView(sendBtn, LinearLayout.LayoutParams(dp(42), dp(42)))
+        card.addView(icons)
+        val cl = LinearLayout.LayoutParams(-1, -2)
+        cl.topMargin = dp(8)
+        panel.addView(card, cl)
 
-        append("Rebirth", "Merhaba! 🎤'a basıp konuşabilir, yazabilir ya da 📷 ile ekranı gösterebilirsin. Telefonu da kontrol ederim: 'YouTube'u aç', 'yarın 7'ye alarm kur', 'sesi kıs' de.")
+        input.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+            override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+            override fun afterTextChanged(s: Editable?) {
+                sendBtn.background = ovalBg(if (s.isNullOrBlank()) "#C9C9D0" else "#111111")
+            }
+        })
+
+        micStyle(false)
+        append("Rebirth", "Merhaba! 🖼 ile ekranı al, 🎤 ile konuş ya da yaz. Telefonu da kontrol ederim: 'YouTube'u aç', 'sesi kıs' de.")
     }
 
     private fun togglePanel() {
@@ -391,16 +424,21 @@ class OverlayService : Service() {
         val t = TextView(this)
         t.text = text
         t.textSize = 15f
-        t.setTextColor(Color.WHITE)
+        t.setTextColor(Color.parseColor("#1A1A1F"))
         t.setPadding(dp(12), dp(8), dp(12), dp(8))
-        val bg = GradientDrawable()
-        bg.setColor(Color.parseColor(if (ai) "#2B2233" else "#1F4E79"))
-        bg.cornerRadius = dp(16).toFloat()
-        t.background = bg
         val lp = LinearLayout.LayoutParams(-2, -2)
-        lp.gravity = if (ai) Gravity.START else Gravity.END
+        if (ai) {
+            lp.gravity = Gravity.START
+            lp.rightMargin = dp(30)
+        } else {
+            val bg = GradientDrawable()
+            bg.setColor(Color.WHITE)
+            bg.cornerRadius = dp(18).toFloat()
+            t.background = bg
+            lp.gravity = Gravity.END
+            lp.leftMargin = dp(40)
+        }
         lp.topMargin = dp(6)
-        if (ai) lp.rightMargin = dp(36) else lp.leftMargin = dp(36)
         chatBox.addView(t, lp)
         scroll.post { scroll.fullScroll(View.FOCUS_DOWN) }
     }
@@ -448,27 +486,119 @@ class OverlayService : Service() {
         )
     }
 
-    private val ACTIONS = """ Kullanıcı telefonda bir işlem yapmanı isterse (uygulama aç, arama, yol tarifi, alarm, zamanlayıcı, ses, el feneri, ayar, müzik kontrolü), SADECE tek satır JSON döndür, başka hiçbir şey yazma. Biçimler: {"action":"open_app","app":"uygulama adı"} {"action":"web_search","query":"..."} {"action":"youtube_search","query":"..."} {"action":"navigate","place":"..."} {"action":"call","number":"..."} {"action":"alarm","hour":7,"minute":30} {"action":"timer","seconds":300} {"action":"settings","page":"wifi|bluetooth|display|sound|battery|apps|general"} {"action":"volume","dir":"up|down|mute"} {"action":"flashlight","on":true} {"action":"media","cmd":"play_pause|next|previous"} {"action":"open_url","url":"https://..."}. Komut değilse normal cevap ver."""
+    private val ACTIONS = """ Kullanıcı telefonda bir işlem yapmanı isterse (uygulama aç, arama, yol tarifi, alarm, zamanlayıcı, ses, el feneri, ayar, müzik kontrolü), SADECE tek satır JSON döndür, başka hiçbir şey yazma. Biçimler: {"action":"open_app","app":"uygulama adı"} {"action":"web_search","query":"..."} {"action":"youtube_search","query":"..."} {"action":"navigate","place":"..."} {"action":"call","name":"kişi adı"} (numara söylenirse {"action":"call","number":"..."}) {"action":"alarm","hour":7,"minute":30} {"action":"timer","seconds":300} {"action":"settings","page":"wifi|bluetooth|display|sound|battery|apps|general"} {"action":"volume","dir":"up|down|mute"} {"action":"flashlight","on":true} {"action":"media","cmd":"play_pause|next|previous"} {"action":"open_url","url":"https://..."} {"action":"remember","note":"hatırlanacak bilgi"} (kullanıcı hatırla/aklında tut derse). Komut değilse normal cevap ver."""
 
     private fun ask(text: String, img: String? = null, byVoice: Boolean = false, allowActions: Boolean = false) {
         history.add("user" to (if (img != null) "[ekran görüntüsü] " + text else text))
         busy = true
+        bubble?.mode = 2
         val key = prefs.getString("api_key", "") ?: ""
         val model = prefs.getString("model", "qwen/qwen3.8-27b") ?: "qwen/qwen3.8-27b"
-        val sys = "Sen Rebirth adında bir oyun asistanısın. Türkçe, kısa, net ve uygulanabilir cevap ver. " +
-            "Oyuncunun şu an oynadığı oyun: " + (game ?: "bilinmiyor") + "." + (if (allowActions) ACTIONS + appHint() else "")
-        val ctx = history.takeLast(12).toList()
+        val sys = "Sen Rebirth: telefondaki akıllı oyun ve telefon asistanısın. Türkçe konuş, kısa ve net ol (en fazla 6 cümle ya da 5 madde). " +
+            "Mobil oyunlarda uzman bir koç gibi davran: strateji, build, ayar ve hata çözümü için somut, uygulanabilir tavsiye ver. " +
+            "Emin olmadığın bilgiyi uydurma, bilmiyorsan açıkça söyle. " +
+            "Oyuncunun şu an oynadığı oyun: " + (game ?: "bilinmiyor") + "." + memoryText() +
+            (if (allowActions) ACTIONS + appHint() else "")
+        val think = !(allowActions && looksLikeCommand(text))
+        if (think) toast("Düşünüyorum...")
+        val ctx = history.takeLast(20).toList()
         Thread {
-            val out = Gemini.ask(key, model, ctx, sys, img)
+            var out = Gemini.ask(key, model, ctx, sys, img, think)
+            if (think && out.startsWith("Uygun model")) out = Gemini.ask(key, model, ctx, sys, img, false)
             handler.post {
                 val done = (if (allowActions) runAction(out) else null) ?: out
                 history.add("model" to done)
                 append("Rebirth", done)
                 busy = false
+                bubble?.mode = 0
                 if (byVoice || speakOn) speak(done)
                 if (!panelOpen) {
                     Toast.makeText(this, "Rebirth: cevap hazır, daireye dokun", Toast.LENGTH_LONG).show()
                 }
+            }
+        }.start()
+    }
+
+    // ---------------- akilli yardimcilar ----------------
+    private fun memoryText(): String {
+        val m = prefs.getString("memory", "") ?: ""
+        return if (m.isBlank()) "" else " Kullanıcı hakkında bildiklerin: " + m.replace("\n", "; ") + "."
+    }
+
+    private fun looksLikeCommand(t: String): Boolean {
+        if (t.trim().split(" ").size > 9) return false
+        val n = norm(t)
+        val keys = listOf("ac", "ara", "kapat", "kur", "baslat", "sesi", "fener", "alarm", "zamanlayici",
+            "yol", "git", "oynat", "durdur", "sonraki", "onceki", "ayar", "hatirla", "aklinda")
+        return keys.any { n.contains(it) }
+    }
+
+    private fun findContact(name: String): Pair<String, String>? {
+        if (checkSelfPermission(Manifest.permission.READ_CONTACTS) != PackageManager.PERMISSION_GRANTED) return null
+        val q = norm(name)
+        if (q.isEmpty()) return null
+        var best: Pair<String, String>? = null
+        var bestScore = 0
+        var bestD = 99
+        val c = contentResolver.query(
+            ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+            arrayOf(ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME, ContactsContract.CommonDataKinds.Phone.NUMBER),
+            null, null, null
+        ) ?: return null
+        c.use {
+            while (it.moveToNext()) {
+                val dn = it.getString(0) ?: continue
+                val num = it.getString(1) ?: continue
+                val n = norm(dn)
+                if (n.isEmpty()) continue
+                val score = when {
+                    n == q -> 4
+                    n.startsWith(q) || q.startsWith(n) -> 3
+                    n.contains(q) || q.contains(n) -> 2
+                    else -> 0
+                }
+                if (score > bestScore) {
+                    bestScore = score
+                    best = Pair(dn, num)
+                } else if (score == 0 && bestScore == 0) {
+                    val d = lev(q, n)
+                    if (d < bestD && d <= Math.max(1, q.length / 3)) {
+                        bestD = d
+                        best = Pair(dn, num)
+                    }
+                }
+            }
+        }
+        return best
+    }
+
+    private fun identifyGame(label: String, tok: Int, retry: Boolean = true) {
+        if (tok != identToken || vd == null) return
+        val key = prefs.getString("api_key", "") ?: ""
+        if (key.isBlank()) return
+        Thread {
+            try {
+                val b64 = grabFrame()
+                if (b64 != null) {
+                    val q = "Bu ekran görüntüsü '" + label + "' uygulamasından. Hangi oyun, mod ya da harita olduğunu tespit et. " +
+                        "SADECE oyunun adını yaz (en fazla 5 kelime). Emin değilsen sadece 'bilinmiyor' yaz."
+                    val out = Gemini.ask(key, "qwen/qwen3.8-27b", listOf("user" to q), "Sen bir oyun tanıma uzmanısın.", b64)
+                        .trim().trim('"', '.', '*')
+                    val bad = out.isEmpty() || out.length > 50 || out.lowercase().contains("bilinmiyor") ||
+                        out.startsWith("Hata") || out.startsWith("Limit") || out.startsWith("API") ||
+                        out.startsWith("Bağlantı") || out.startsWith("Uygun") || out.startsWith("Önce")
+                    handler.post {
+                        if (tok == identToken) {
+                            if (!bad) {
+                                game = if (norm(out).contains(norm(label))) out else label + " — " + out
+                                title.text = "🎮 " + game
+                            } else if (retry) {
+                                handler.postDelayed({ identifyGame(label, tok, false) }, 25000)
+                            }
+                        }
+                    }
+                }
+            } catch (e: Exception) {
             }
         }.start()
     }
@@ -602,10 +732,17 @@ class OverlayService : Service() {
                 return "🧭 Haritada açılıyor: " + p
             }
             "call" -> {
-                val n = j.optString("number")
-                if (n.isBlank()) return "Hangi numarayı arayayım?"
+                var n = j.optString("number")
+                var who = ""
+                val nm = j.optString("name")
+                if (n.isBlank() && nm.isNotBlank()) {
+                    val c = findContact(nm) ?: return "'" + nm + "' adında kişi bulamadım (Rehber izni verdin mi?)"
+                    n = c.second
+                    who = c.first
+                }
+                if (n.isBlank()) return "Kimi arayayım?"
                 launch(Intent(Intent.ACTION_DIAL, Uri.parse("tel:" + Uri.encode(n))))
-                return "📞 Çeviriciye " + n + " yazıldı, aramak için yeşil tuşa bas"
+                return "📞 " + (if (who.isNotEmpty()) who + " " else "") + n + " çeviriciye yazıldı, aramak için yeşil tuşa bas"
             }
             "alarm" -> {
                 val h = j.optInt("hour", 7)
@@ -667,6 +804,13 @@ class OverlayService : Service() {
                 am.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_UP, code))
                 return "🎵 Müzik komutu gönderildi"
             }
+            "remember" -> {
+                val note = j.optString("note")
+                if (note.isBlank()) return "Ne hatırlayayım?"
+                val cur = (prefs.getString("memory", "") ?: "").split("\n").filter { it.isNotBlank() }
+                prefs.edit().putString("memory", (cur + note).takeLast(20).joinToString("\n")).apply()
+                return "🧠 Hatırlayacağım: " + note
+            }
             "open_url" -> {
                 val u = j.optString("url")
                 if (!u.startsWith("http")) return "Sadece web adreslerini açabilirim"
@@ -682,6 +826,41 @@ class OverlayService : Service() {
         if (!ttsReady) return
         val clean = text.replace(Regex("[*#_`>]"), "").take(700)
         tts?.speak(clean, TextToSpeech.QUEUE_FLUSH, null, "rebirth")
+    }
+
+    private val silenceWatcher = object : Runnable {
+        override fun run() {
+            if (!recording) return
+            val amp = try { recorder?.maxAmplitude ?: 0 } catch (e: Exception) { 0 }
+            val now = System.currentTimeMillis()
+            if (amp > 2000) {
+                heardVoice = true
+                lastLoud = now
+            }
+            if (heardVoice && now - lastLoud > 1300) {
+                stopAndTranscribe()
+                return
+            }
+            if (!heardVoice && now - recStart > 6000) {
+                cancelRecording()
+                return
+            }
+            if (now - recStart > 12000) {
+                stopAndTranscribe()
+                return
+            }
+            handler.postDelayed(this, 150)
+        }
+    }
+
+    private fun cancelRecording() {
+        recording = false
+        micStyle(false)
+        val r = recorder
+        recorder = null
+        try { r?.stop() } catch (e: Exception) { }
+        try { r?.release() } catch (e: Exception) { }
+        toast("Ses duyulmadı, tekrar dene")
     }
 
     private fun toggleMic() {
@@ -815,6 +994,12 @@ class OverlayService : Service() {
             audioFile = f
             recording = true
             micStyle(true)
+            recStart = System.currentTimeMillis()
+            lastLoud = recStart
+            heardVoice = false
+            input.setText("")
+            input.hint = "🎤 Dinliyorum... konuş"
+            handler.postDelayed(silenceWatcher, 400)
         } catch (e: Exception) {
             recorder = null
             toast("Mikrofon başlatılamadı: " + e.message)
@@ -822,7 +1007,9 @@ class OverlayService : Service() {
     }
 
     private fun stopAndTranscribe() {
+        if (!recording) return
         recording = false
+        input.hint = "Ne öğrenmek istersin?"
         micStyle(false)
         val r = recorder
         recorder = null
@@ -847,7 +1034,8 @@ class OverlayService : Service() {
                     toast(if (res != null && res.startsWith("ERR:")) res.substring(4) else "Sesi anlayamadım, tekrar dene")
                 } else {
                     input.setText(res)
-                    submitVoice(res)
+                    input.setSelection(input.text.length)
+                    handler.postDelayed({ submitVoice(res) }, 900)
                 }
             }
         }.start()
@@ -970,13 +1158,16 @@ class OverlayService : Service() {
                 val pkg = GameDetector.foreground(this@OverlayService)
                 if (pkg != null) {
                     val g = GameDetector.gameName(this@OverlayService, pkg)
-                    if (g != game) {
+                    if (g != baseGame) {
+                        baseGame = g
                         game = g
+                        identToken++
                         bubble?.active = g != null
                         title.text = if (g != null) "🎮 " + g else "🔥 Rebirth"
-                        if (g != null && !busy) {
+                        if (g != null) {
                             history.clear()
-                            ask("'" + g + "' oynuyorum. Maksimum 5 madde: ipuçları, yaygın hatalar, ayar önerisi.")
+                            val tok = identToken
+                            handler.postDelayed({ identifyGame(g, tok) }, 10000)
                         }
                     }
                 }
