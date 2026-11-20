@@ -18,6 +18,12 @@ import java.io.File
 import java.util.Locale
 import android.provider.ContactsContract
 import android.os.Bundle
+import android.content.pm.ApplicationInfo
+import android.text.TextUtils
+import android.view.animation.OvershootInterpolator
+import org.xmlpull.v1.XmlPullParser
+import java.net.HttpURLConnection
+import java.net.URL
 import android.text.Editable
 import android.text.TextWatcher
 import android.content.ComponentName
@@ -62,6 +68,7 @@ import android.widget.Toast
 class OverlayService : Service() {
     companion object {
         var running = false
+        var instance: OverlayService? = null
     }
 
     private lateinit var wm: WindowManager
@@ -86,6 +93,12 @@ class OverlayService : Service() {
     private var recognizer: SpeechRecognizer? = null
     private var listening = false
     private var liveBad = true
+    private var micDownAt = 0L
+    private var micConsumed = false
+    private val bannerQueue = ArrayDeque<Banner>()
+    private var bannerShowing = false
+    private var bannerView: View? = null
+    private val seenNotifs = HashMap<String, Long>()
     private var baseGame: String? = null
     private var identToken = 0
     private var recStart = 0L
@@ -109,6 +122,7 @@ class OverlayService : Service() {
     override fun onCreate() {
         super.onCreate()
         running = true
+        instance = this
         prefs = getSharedPreferences("rebirth", MODE_PRIVATE)
         wm = getSystemService(WINDOW_SERVICE) as WindowManager
         startAsForeground()
@@ -137,6 +151,7 @@ class OverlayService : Service() {
 
     override fun onDestroy() {
         running = false
+        instance = null
         handler.removeCallbacksAndMessages(null)
         cleanupProjection()
         try { tts?.stop(); tts?.shutdown() } catch (e: Exception) { }
@@ -264,7 +279,7 @@ class OverlayService : Service() {
     }
 
     private fun micStyle(rec: Boolean) {
-        mic.background = if (rec) ovalBg("#FFD0D0") else null
+        mic.background = ovalBg(if (rec) "#FFB3B3" else "#FFE3CC")
         mic.text = if (rec) "⏹" else "🎤"
         bubble?.mode = if (rec) 1 else 0
         micAnim?.cancel()
@@ -375,7 +390,19 @@ class OverlayService : Service() {
         mic = TextView(this)
         mic.textSize = 20f
         mic.gravity = Gravity.CENTER
-        mic.setOnClickListener { toggleMic() }
+        mic.setOnTouchListener { _, e ->
+            when (e.action) {
+                MotionEvent.ACTION_DOWN -> {
+                    micDownAt = System.currentTimeMillis()
+                    micConsumed = recording || listening
+                    toggleMic()
+                }
+                MotionEvent.ACTION_UP -> {
+                    if (!micConsumed && recording && System.currentTimeMillis() - micDownAt > 600) stopAndTranscribe()
+                }
+            }
+            true
+        }
         icons.addView(mic, LinearLayout.LayoutParams(dp(44), dp(44)))
         icons.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
         val sendBtn = TextView(this)
@@ -486,12 +513,13 @@ class OverlayService : Service() {
         )
     }
 
-    private val ACTIONS = """ Kullanıcı telefonda bir işlem yapmanı isterse (uygulama aç, arama, yol tarifi, alarm, zamanlayıcı, ses, el feneri, ayar, müzik kontrolü), SADECE tek satır JSON döndür, başka hiçbir şey yazma. Biçimler: {"action":"open_app","app":"uygulama adı"} {"action":"web_search","query":"..."} {"action":"youtube_search","query":"..."} {"action":"navigate","place":"..."} {"action":"call","name":"kişi adı"} (numara söylenirse {"action":"call","number":"..."}) {"action":"alarm","hour":7,"minute":30} {"action":"timer","seconds":300} {"action":"settings","page":"wifi|bluetooth|display|sound|battery|apps|general"} {"action":"volume","dir":"up|down|mute"} {"action":"flashlight","on":true} {"action":"media","cmd":"play_pause|next|previous"} {"action":"open_url","url":"https://..."} {"action":"remember","note":"hatırlanacak bilgi"} (kullanıcı hatırla/aklında tut derse). Komut değilse normal cevap ver."""
+    private val ACTIONS = """ Kullanıcı telefonda bir işlem yapmanı isterse (uygulama aç, arama, yol tarifi, alarm, zamanlayıcı, ses, el feneri, ayar, müzik kontrolü), SADECE tek satır JSON döndür, başka hiçbir şey yazma. Biçimler: {"action":"open_app","app":"uygulama adı"} {"action":"web_search","query":"..."} {"action":"youtube_search","query":"..."} {"action":"navigate","place":"..."} {"action":"call","name":"kişi adı"} (numara söylenirse {"action":"call","number":"..."}) {"action":"alarm","hour":7,"minute":30} {"action":"timer","seconds":300} {"action":"settings","page":"wifi|bluetooth|display|sound|battery|apps|general"} {"action":"volume","dir":"up|down|mute"} {"action":"flashlight","on":true} {"action":"media","cmd":"play_pause|next|previous"} {"action":"open_url","url":"https://..."} {"action":"news"} (kullanıcı haber, gündem, neler oldu derse) {"action":"remember","note":"hatırlanacak bilgi"} (kullanıcı hatırla/aklında tut derse). Komut değilse normal cevap ver."""
 
     private fun ask(text: String, img: String? = null, byVoice: Boolean = false, allowActions: Boolean = false) {
         history.add("user" to (if (img != null) "[ekran görüntüsü] " + text else text))
         busy = true
         bubble?.mode = 2
+        mic.text = "⏳"
         val key = prefs.getString("api_key", "") ?: ""
         val model = prefs.getString("model", "qwen/qwen3.8-27b") ?: "qwen/qwen3.8-27b"
         val sys = "Sen Rebirth: telefondaki akıllı oyun ve telefon asistanısın. Türkçe konuş, kısa ve net ol (en fazla 6 cümle ya da 5 madde). " +
@@ -511,10 +539,251 @@ class OverlayService : Service() {
                 append("Rebirth", done)
                 busy = false
                 bubble?.mode = 0
+                mic.text = "🎤"
                 if (byVoice || speakOn) speak(done)
                 if (!panelOpen) {
                     Toast.makeText(this, "Rebirth: cevap hazır, daireye dokun", Toast.LENGTH_LONG).show()
                 }
+            }
+        }.start()
+    }
+
+    // ---------------- bildirimler ve haberler ----------------
+    private fun appLabel(pkg: String): String = try {
+        packageManager.getApplicationLabel(packageManager.getApplicationInfo(pkg, 0)).toString()
+    } catch (e: Exception) {
+        pkg
+    }
+
+    private fun appCategory(pkg: String): Int = try {
+        packageManager.getApplicationInfo(pkg, 0).category
+    } catch (e: Exception) {
+        -1
+    }
+
+    private val privatePkgs = setOf(
+        "com.whatsapp", "org.telegram.messenger", "com.google.android.apps.messaging",
+        "com.samsung.android.messaging", "com.google.android.gm", "com.instagram.android",
+        "org.thoughtcrime.securesms", "com.facebook.orca", "com.android.mms",
+        "com.android.incallui", "com.google.android.dialer"
+    )
+
+    fun onNotif(pkg: String, title: String, text: String, category: String) {
+        handler.post { handleNotif(pkg, title, text, category) }
+    }
+
+    private fun handleNotif(pkg: String, title: String, text: String, category: String) {
+        if (pkg in privatePkgs) return
+        if (category == Notification.CATEGORY_MESSAGE || category == Notification.CATEGORY_EMAIL ||
+            category == Notification.CATEGORY_CALL
+        ) return
+        val sig = pkg + "|" + title + "|" + text
+        val now = System.currentTimeMillis()
+        if (now - (seenNotifs[sig] ?: 0L) < 120000) return
+        if (seenNotifs.size > 200) seenNotifs.clear()
+        seenNotifs[sig] = now
+
+        val label = appLabel(pkg)
+        val all = norm(label + " " + title + " " + text)
+        val open: () -> Unit = {
+            val li = packageManager.getLaunchIntentForPackage(pkg)
+            if (li != null) launch(li)
+        }
+        // 1) ezan / namaz vakti
+        if (all.contains("ezan") || all.contains("namaz") || all.contains("imsak") ||
+            all.contains("iftar") || all.contains("sahur")
+        ) {
+            showBanner(Banner("🕌", if (title.isNotBlank()) title else "Vakit geldi", text, "Aç", open))
+            return
+        }
+        // 2) guncelleme
+        if (all.contains("guncelle") || all.contains("updateavailable") || all.contains("newversion")) {
+            val play: () -> Unit = {
+                try {
+                    launch(Intent(Intent.ACTION_VIEW, Uri.parse("market://details?id=" + pkg)))
+                } catch (e: Exception) {
+                    open()
+                }
+            }
+            showBanner(
+                Banner(
+                    "⬆️", "Güncelleme var: " + label, if (text.isNotBlank()) text else title,
+                    "Hemen güncelle", if (pkg == "com.android.vending") open else play
+                )
+            )
+            return
+        }
+        // 3) yapay zekanin bakabilecegi uygulamalar: YouTube, haber, oyun
+        val cat = appCategory(pkg)
+        if (pkg == "com.google.android.youtube" || cat == ApplicationInfo.CATEGORY_NEWS || cat == ApplicationInfo.CATEGORY_GAME) {
+            analyzeNotif(pkg, label, title, text, open)
+            return
+        }
+        if (prefs.getBoolean("notif_all", false)) {
+            showBanner(Banner("🔔", label, (title + " " + text).trim(), "Aç", open))
+        }
+    }
+
+    private fun analyzeNotif(pkg: String, label: String, title: String, text: String, open: () -> Unit) {
+        val key = prefs.getString("api_key", "") ?: ""
+        if (key.isBlank()) return
+        val icon = if (pkg == "com.google.android.youtube") "▶️" else if (appCategory(pkg) == ApplicationInfo.CATEGORY_NEWS) "📰" else "🎮"
+        val prompt = "Uygulama: " + label + "\nBildirim başlığı: " + title + "\nMetin: " + text +
+            "\n\nKullanıcıya TEK cümlelik, çok kısa Türkçe tavsiye ya da özet yaz (en fazla 20 kelime). " +
+            "Önemsiz ya da reklamsa sadece SKIP yaz."
+        val sys = "Sen Rebirth asistanısın, bildirimleri kullanıcı için süzüyorsun." + memoryText()
+        Thread {
+            val out = Gemini.ask(key, "qwen/qwen3.8-27b", listOf("user" to prompt), sys).trim()
+            val bad = out.isEmpty() || out.contains("SKIP") || out.startsWith("Hata") || out.startsWith("Limit") ||
+                out.startsWith("API") || out.startsWith("Bağlantı") || out.startsWith("Uygun") || out.startsWith("Önce")
+            if (!bad) handler.post { showBanner(Banner(icon, label, out, "Aç", open)) }
+        }.start()
+    }
+
+    private fun showBanner(b: Banner) {
+        bannerQueue.addLast(b)
+        nextBanner()
+    }
+
+    private fun nextBanner() {
+        if (bannerShowing) return
+        val b = bannerQueue.removeFirstOrNull() ?: return
+        bannerShowing = true
+        val root = LinearLayout(this)
+        root.orientation = LinearLayout.HORIZONTAL
+        root.gravity = Gravity.CENTER_VERTICAL
+        root.setPadding(dp(16), dp(12), dp(12), dp(12))
+        val bg = GradientDrawable()
+        bg.setColor(Color.parseColor("#F2000000"))
+        bg.cornerRadius = dp(30).toFloat()
+        bg.setStroke(dp(1), Color.parseColor("#66FF7A00"))
+        root.background = bg
+        val ic = TextView(this)
+        ic.text = b.icon
+        ic.textSize = 24f
+        ic.setPadding(0, 0, dp(12), 0)
+        root.addView(ic)
+        val col = LinearLayout(this)
+        col.orientation = LinearLayout.VERTICAL
+        val h = TextView(this)
+        h.text = b.head
+        h.setTextColor(Color.WHITE)
+        h.textSize = 14f
+        h.setTypeface(null, Typeface.BOLD)
+        h.maxLines = 1
+        h.ellipsize = TextUtils.TruncateAt.END
+        val t = TextView(this)
+        t.text = b.body
+        t.setTextColor(Color.parseColor("#CFCFD8"))
+        t.textSize = 13f
+        t.maxLines = 2
+        t.ellipsize = TextUtils.TruncateAt.END
+        col.addView(h)
+        col.addView(t)
+        root.addView(col, LinearLayout.LayoutParams(0, -2, 1f))
+        if (b.action != null) {
+            val a = TextView(this)
+            a.text = b.action
+            a.setTextColor(Color.BLACK)
+            a.textSize = 13f
+            a.setTypeface(null, Typeface.BOLD)
+            a.setPadding(dp(14), dp(8), dp(14), dp(8))
+            val abg = GradientDrawable()
+            abg.setColor(Color.parseColor("#FF7A00"))
+            abg.cornerRadius = dp(18).toFloat()
+            a.background = abg
+            val al = LinearLayout.LayoutParams(-2, -2)
+            al.leftMargin = dp(8)
+            root.addView(a, al)
+        }
+        root.setOnClickListener {
+            try { b.onTap() } catch (e: Exception) { }
+            dismissBanner()
+        }
+        val m = resources.displayMetrics
+        val lp = params((m.widthPixels * 0.93).toInt(), -2, false)
+        lp.gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+        lp.y = dp(26)
+        root.translationY = -dp(140).toFloat()
+        root.alpha = 0f
+        wm.addView(root, lp)
+        bannerView = root
+        root.animate().translationY(0f).alpha(1f).setDuration(380)
+            .setInterpolator(OvershootInterpolator(0.8f)).start()
+        handler.postDelayed({ if (bannerView === root) dismissBanner() }, 7500)
+    }
+
+    private fun dismissBanner() {
+        val v = bannerView ?: return
+        bannerView = null
+        v.animate().translationY(-dp(140).toFloat()).alpha(0f).setDuration(250).withEndAction {
+            try { wm.removeView(v) } catch (e: Exception) { }
+            bannerShowing = false
+            nextBanner()
+        }.start()
+    }
+
+    private fun rssTitles(url: String, max: Int): List<String> {
+        val out = mutableListOf<String>()
+        val c = URL(url).openConnection() as HttpURLConnection
+        c.connectTimeout = 8000
+        c.readTimeout = 8000
+        c.setRequestProperty("User-Agent", "Mozilla/5.0")
+        c.inputStream.use { st ->
+            val p = android.util.Xml.newPullParser()
+            p.setInput(st, null)
+            var inItem = false
+            var ev = p.eventType
+            while (ev != XmlPullParser.END_DOCUMENT && out.size < max) {
+                if (ev == XmlPullParser.START_TAG) {
+                    if (p.name == "item") {
+                        inItem = true
+                    } else if (inItem && p.name == "title") {
+                        val t = p.nextText().trim()
+                        if (t.isNotEmpty()) out.add(t)
+                    }
+                } else if (ev == XmlPullParser.END_TAG && p.name == "item") {
+                    inItem = false
+                }
+                ev = p.next()
+            }
+        }
+        c.disconnect()
+        return out
+    }
+
+    private fun fetchNews() {
+        val key = prefs.getString("api_key", "") ?: ""
+        if (key.isBlank()) {
+            append("Rebirth", "Önce Groq anahtarını gir.")
+            return
+        }
+        Thread {
+            val items = mutableListOf<String>()
+            val feeds = listOf(
+                "https://feeds.bbci.co.uk/turkce/rss.xml",
+                "https://www.trthaber.com/sondakika.rss",
+                "https://www.aa.com.tr/tr/rss/default?cat=guncel"
+            )
+            for (f in feeds) {
+                try { items.addAll(rssTitles(f, 8)) } catch (e: Exception) { }
+            }
+            val out: String
+            if (items.isEmpty()) {
+                out = "Haber kaynaklarına ulaşamadım, internetini kontrol et."
+            } else {
+                val q = "Aşağıdaki haber başlıklarından bugünün en önemli 5 gelişmesini Türkçe, madde madde, " +
+                    "her biri en fazla 15 kelime olacak şekilde özetle. Aynı haberi tekrar etme.\n" + items.joinToString("\n")
+                out = Gemini.ask(key, "qwen/qwen3.8-27b", listOf("user" to q), "Sen kısa ve tarafsız bir haber özetleyicisisin.")
+            }
+            handler.post {
+                append("Rebirth", "📰 Günün haberleri:\n" + out)
+                if (!panelOpen) {
+                    showBanner(Banner("📰", "Günün haberleri hazır", out.lineSequence().firstOrNull() ?: "", "Oku") {
+                        if (!panelOpen) togglePanel()
+                    })
+                }
+                if (speakOn) speak(out)
             }
         }.start()
     }
@@ -529,7 +798,7 @@ class OverlayService : Service() {
         if (t.trim().split(" ").size > 9) return false
         val n = norm(t)
         val keys = listOf("ac", "ara", "kapat", "kur", "baslat", "sesi", "fener", "alarm", "zamanlayici",
-            "yol", "git", "oynat", "durdur", "sonraki", "onceki", "ayar", "hatirla", "aklinda")
+            "yol", "git", "oynat", "durdur", "sonraki", "onceki", "ayar", "hatirla", "aklinda", "haber", "gundem")
         return keys.any { n.contains(it) }
     }
 
@@ -804,6 +1073,10 @@ class OverlayService : Service() {
                 am.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_UP, code))
                 return "🎵 Müzik komutu gönderildi"
             }
+            "news" -> {
+                fetchNews()
+                return "📰 Haberleri getiriyorum..."
+            }
             "remember" -> {
                 val note = j.optString("note")
                 if (note.isBlank()) return "Ne hatırlayayım?"
@@ -1011,6 +1284,7 @@ class OverlayService : Service() {
         recording = false
         input.hint = "Ne öğrenmek istersin?"
         micStyle(false)
+        mic.text = "⏳"
         val r = recorder
         recorder = null
         try {
@@ -1030,6 +1304,7 @@ class OverlayService : Service() {
             val res = Gemini.transcribe(key, f, hint)
             handler.post {
                 busy = false
+                mic.text = "🎤"
                 if (res == null || res.isBlank() || res.startsWith("ERR:")) {
                     toast(if (res != null && res.startsWith("ERR:")) res.substring(4) else "Sesi anlayamadım, tekrar dene")
                 } else {
@@ -1176,3 +1451,5 @@ class OverlayService : Service() {
         }
     }
 }
+
+private class Banner(val icon: String, val head: String, val body: String, val action: String?, val onTap: () -> Unit)

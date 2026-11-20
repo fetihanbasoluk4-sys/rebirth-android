@@ -120,6 +120,9 @@ class MainActivity : Activity() {
         pill(c2, "3+  Arka planda kapanmasın", "#2A2A3A", "#FFFFFF") {
             startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:" + packageName)))
         }
+        pill(c2, "5   Bildirim erişimi (ezan, güncelleme, haber)", "#2A2A3A", "#FFFFFF") {
+            startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+        }
         keyBox = EditText(this)
         keyBox.hint = "Groq API anahtarı"
         keyBox.setTextColor(Color.WHITE)
@@ -158,6 +161,14 @@ class MainActivity : Activity() {
         sw.isChecked = prefs.getBoolean("autostart", false)
         sw.setOnCheckedChangeListener { _, v -> prefs.edit().putBoolean("autostart", v).apply() }
         c3.addView(sw)
+        val sw2 = Switch(this)
+        sw2.text = "Tüm uygulama bildirimlerini üstte göster (mesajlaşma hariç)"
+        sw2.setTextColor(Color.WHITE)
+        sw2.isChecked = prefs.getBoolean("notif_all", false)
+        sw2.setOnCheckedChangeListener { _, v -> prefs.edit().putBoolean("notif_all", v).apply() }
+        val sw2lp = LinearLayout.LayoutParams(-1, -2)
+        sw2lp.topMargin = dp(14)
+        c3.addView(sw2, sw2lp)
 
         val sv = ScrollView(this)
         val bg = GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM, intArrayOf(Color.parseColor("#0E0E15"), Color.parseColor("#1A1024")))
@@ -196,6 +207,7 @@ class MainActivity : Activity() {
         val micOk = checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
         status.text = mark(Settings.canDrawOverlays(this)) + "  Üstte gösterme izni\n" +
             mark(GameDetector.hasAccess(this)) + "  Kullanım erişimi\n" +
+            mark((Settings.Secure.getString(contentResolver, "enabled_notification_listeners") ?: "").contains(packageName)) + "  Bildirim erişimi\n" +
             mark(micOk) + "  Mikrofon\n" +
             mark(checkSelfPermission(Manifest.permission.READ_CONTACTS) == PackageManager.PERMISSION_GRANTED) + "  Rehber\n" +
             mark(!prefs.getString("api_key", "").isNullOrBlank()) + "  Groq anahtarı\n" +
